@@ -62,7 +62,10 @@ async function fixture(options = {}) {
     steer: vi.fn(() => { const ack = deferred(); acks.push(ack); return ack.promise; }),
     cancel: vi.fn(async () => gate.resolve()),
     async *stream() {
+      yield { type: "summary", status: "running" };
       await gate.promise;
+      yield { type: "summary", status: "error" };
+      yield { type: "summary", status: "completed", fallback: true };
       yield { type: "assistant", message: { content: [{ type: "text", text: "Finished" }] } };
     },
     wait: async () => ({ status: "finished", result: "" })

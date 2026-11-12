@@ -83,7 +83,13 @@ tool definition using `output_schema`.
 
 ## Batch discovery
 
-The SDK does not expose a batch count or batch-end event. `modelCallId` groups observed generation events but cannot prove that every callback has arrived. The Bridge therefore freezes the currently parked calls after the configured quiet window, currently 10 ms from the latest `stream_running` event or callback.
+SDK 1.3.1 exposes a `tool-requests-listed` interaction update with a `callCount`
+after the model lists a step's tools. This is not a count of forwarded custom-tool
+callbacks, nor proof that every callback has arrived. `modelCallId` also only
+groups observed generation events. The Bridge keeps its existing barrier rule:
+freeze currently parked calls after the configured quiet window, currently
+10 ms from the latest `stream_running` event or callback. The new update does
+not settle callbacks or independently publish a batch.
 
 Calls arriving after the window remain parked and form the next barrier after the current batch settles. This may reduce parallelism, but it must not change call IDs, result ownership, or side-effect semantics.
 

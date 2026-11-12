@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
 import {
   CURSOR_SDK_SUMMARY_FILTER_SIGNATURE,
   CURSOR_SDK_SUMMARY_HOOK_MARKER,
@@ -10,7 +12,65 @@ import {
   transformCursorSdkSource
 } from "./cursor-sdk-summary-loader.mjs";
 
+// Exercise the installed accumulator, including its conversation bookkeeping,
+// without starting an executor or making a model request. Its usage() method
+// references another bundle module; this test only uses apply/conversation.
+function installedAccumulator(source) {
+  const ast = ts.createSourceFile("sdk.js", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const matches = [];
+  function visit(node) {
+    if (ts.isClassDeclaration(node)) {
+      const methods = new Set(node.members.map((member) => member.name?.getText(ast)));
+      if (["apply", "flushPendingStep", "mergeIntoConversation"].every((name) => methods.has(name))) {
+        matches.push(node.getText(ast));
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  expect(matches).toHaveLength(1);
+  return runInNewContext(`(${matches[0]})`);
+}
+
 describe("Cursor SDK summary loader", () => {
+  it.each([false, true])("preserves real accumulator text and tools with awaited summary callbacks (hook=%s)", async (hook) => {
+    const contract = resolveCursorSdkLoadContract();
+    const original = readFileSync(fileURLToPath(contract.entryUrl), "utf8");
+    const source = hook ? transformCursorSdkSource(original, {
+      url: contract.entryUrl, expectedUrl: contract.entryUrl, packageVersion: contract.packageVersion
+    }) : original;
+    const Accumulator = installedAccumulator(source);
+    const observed = [];
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const accumulator = new Accumulator({ onDelta: async ({ update }) => {
+      if (update.type === "summary-started") await gate;
+      observed.push(update);
+    } });
+    const text = { type: "text-delta", text: "before " };
+    await accumulator.apply(text);
+    let completed = false;
+    const started = { type: "summary-started" };
+    const pending = accumulator.apply(started).then(() => { completed = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(completed).toBe(!hook);
+    release();
+    await pending;
+    const updates = [
+      { type: "summary", summary: "synthetic checkpoint" },
+      { type: "summary-completed", failed: true, fallback: true },
+      { type: "text-delta", text: "after" },
+      { type: "tool-requests-listed", callCount: 1 },
+      { type: "tool-call-completed", toolCall: { type: "inspect", args: { step: 1 } } }
+    ];
+    for (const update of updates) await accumulator.apply(update);
+    expect(observed).toEqual(hook ? [text, started, ...updates] : [text, ...updates.slice(2)]);
+    expect(accumulator.conversation()[0].turn.steps).toEqual([
+      { type: "assistantMessage", message: { text: "before after" } },
+      { type: "toolCall", message: { type: "inspect", args: { step: 1 } } }
+    ]);
+  });
+
   it("transforms the installed ESM bundle exactly once", () => {
     const contract = resolveCursorSdkLoadContract();
     const source = readFileSync(fileURLToPath(contract.entryUrl), "utf8");
@@ -27,7 +87,7 @@ describe("Cursor SDK summary loader", () => {
   });
 
   it.each([
-    ["version", { packageVersion: "1.0.28" }],
+    ["previous pinned version", { packageVersion: "1.0.31" }],
     ["URL", { url: "file:///tmp/not-cursor-sdk.js" }],
     ["signature", { source: "export const sdk = true;" }],
     ["duplicate signature", { source: `${CURSOR_SDK_SUMMARY_FILTER_SIGNATURE};${CURSOR_SDK_SUMMARY_FILTER_SIGNATURE}` }]

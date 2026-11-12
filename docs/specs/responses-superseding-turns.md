@@ -123,7 +123,7 @@ or failed delivery from this delay.
 fallback path without another native attempt. Terminal delivery waits for an
 outstanding SDK ACK before deciding whether a fallback is needed. The Bridge
 does not impose an additional ACK timeout or dispatch a second copy while the
-SDK promise remains pending. SDK 1.0.31 owns the initial 15-second ACK deadline;
+SDK promise remains pending. SDK 1.3.1 owns the initial 15-second ACK deadline;
 its queued acknowledgement removes that deadline. The public outcome does not
 distinguish rejection, next-turn queuing, and an initial ACK timeout, so fallback
 relies on the SDK's `revert_to_followup` delivery contract.

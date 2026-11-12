@@ -12,7 +12,7 @@ pending tool deliveries. Responses is the conformance path; see
 
 ## Credentials And Executor Ownership
 
-The dependency is pinned to `@cursor/sdk@1.0.31`. Its authenticated transport
+The dependency is pinned to `@cursor/sdk@1.3.1`. Its authenticated transport
 refreshes credentials before JWT expiry, at the later of expiry minus five
 minutes and the credential lifetime midpoint. Credentials without a usable
 JWT expiry use a conservative 30-minute local lifetime. Concurrent refreshes

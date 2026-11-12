@@ -2679,6 +2679,8 @@ function traceSdkPayload(event) {
       return { type: "status", status: event.status, message: event.message };
     case "task":
       return { type: "task", status: event.status, text: event.text };
+    case "summary":
+      return { type: "summary", status: event.status, fallback: event.fallback };
     case "request":
       return { type: "request", requestId: event.request_id };
     case "system":
@@ -2779,6 +2781,20 @@ function normalizeSdkEvent(event) {
       return usage
         ? [{ kind: "usage", sdkType, usage }]
         : semanticUnknownSdkEvent(sdkType, "invalid_usage");
+    }
+    case "summary": {
+      if (!["running", "completed", "error"].includes(event.status)) {
+        return semanticUnknownSdkEvent(sdkType, "unknown_summary_status");
+      }
+      if (event.fallback !== undefined && typeof event.fallback !== "boolean") {
+        return semanticUnknownSdkEvent(sdkType, "invalid_summary_fallback");
+      }
+      // Summary failure leaves the SDK conversation unchanged; it is not a
+      // failed Run. Tool callbacks and the public transcript keep their owner.
+      return [{
+        kind: "diagnostic", sdkType, name: "summary", status: event.status,
+        ...(event.fallback !== undefined ? { fallback: event.fallback } : {})
+      }];
     }
     case "status": {
       if (event.status === "CREATING" || event.status === "RUNNING") {

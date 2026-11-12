@@ -29,6 +29,7 @@ emitted.
 | `tool_call` | `tool_call` | Validate ID, name, and status before updating the pending batch. |
 | `thinking` | `reasoning` | Preserve text and optional duration inside the Bridge event contract; public protocol mappers ignore it. |
 | `usage` | `usage` | Accept only complete, finite, non-negative token usage. |
+| `summary` `running`/`completed`/`error` | `diagnostic` | Observe compaction without changing Run or tool ownership; optional `fallback` must be boolean. |
 | `status` `CREATING`/`RUNNING` | `progress` | Keep the request alive without changing terminal state. |
 | `status` `FINISHED`/`ERROR`/`CANCELLED`/`EXPIRED` | `terminal-impacting` | Retain terminal evidence and reconcile it with `Run.wait()`. |
 | `system`/`user`/`request`/`task` | `diagnostic` | Trace without changing the public response. |
@@ -48,6 +49,7 @@ code `sdk_semantic_unknown`:
 - missing tool call ID or name, or an unknown tool status;
 - malformed thinking text or duration;
 - malformed per-turn usage or malformed `Run.wait()` usage;
+- unknown summary status or malformed summary fallback flag;
 - unknown, conflicting, or inconsistent terminal status;
 - malformed `Run.wait()` result status.
 
@@ -72,13 +74,21 @@ message is emitted, the validated `Run.wait()` result remains authoritative.
 
 ## Native compaction observation
 
-`@cursor/sdk@1.0.31` suppresses `summary-started`, `summary`, and
+`@cursor/sdk@1.3.1` suppresses `summary-started`, `summary`, and
 `summary-completed` before its documented per-send `onDelta` callback. The
 Bridge registers the synchronous hook in `bridge/cursor-sdk-summary-loader.mjs`
 before loading the SDK and removes only that suppression predicate from the
 loaded ESM source. The hook requires the exact package name, version, resolved ESM entry, and one
 exact source signature match. Any drift prevents Bridge startup; there is no
 fallback to the public `task` event.
+
+SDK 1.3.1 also emits public `summary` stream messages with `running`,
+`completed`, or `error` status and optional boolean `fallback`. These describe
+summarization, not Run completion: an `error` leaves the conversation unchanged,
+and a completed fallback means the SDK saved a trimmed transcript. Neither is
+a reason to fail or replay the Run. The source hook remains necessary to observe
+the summary content update through `onDelta`; stream messages contain no summary
+text. Malformed summary messages retain the semantic-unknown failure contract.
 
 Summary updates are observations, not terminal errors. Native compaction changes
 the SDK's internal conversation checkpoint while the same Run continues. The
@@ -98,10 +108,12 @@ does not create one.
 
 The [official SDK reference](https://cursor.com/docs/sdk/typescript#interaction-updates)
 lists summary updates among normal interaction updates and documents awaited
-callbacks. The [release notes for 1.0.31](https://cursor.com/docs/release-notes/sdk#sep-3-2026)
-describe background subagent follow-ups and custom-tool annotations, not a
-requirement to fail on compaction. The package remains pinned to 1.0.31;
-changing versions requires separately validating the loader contract.
+callbacks. The package is pinned to 1.3.1; changing versions requires separately
+validating the loader contract. Automated coverage executes the installed
+interaction accumulator before and after transformation, checks awaited
+callbacks and unchanged text/tool bookkeeping, and loads the transformed SDK
+in a fresh Node process. SDK cloud calls remain mocked in lifecycle tests;
+those tests do not establish live backend or client-harness acceptance.
 
 ## Reasoning boundary
 
@@ -151,7 +163,7 @@ exposed by public protocol mappers.
 
 ## Conformance
 
-Automated tests must cover all nine documented SDK message categories,
+Automated tests must cover all ten documented SDK message categories,
 assistant multi-block atomicity, every tool status, usage validation, terminal
 reconciliation, unknown semantic shapes, loader drift, native compaction before
 Run attachment, continued text and tools, unchanged transcript validation,

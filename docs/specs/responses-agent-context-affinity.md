@@ -106,7 +106,7 @@ recall of all earlier content by the model. See
 
 ## Image inputs
 
-The local Bridge sends base64 PNG, JPEG, WebP and GIF inputs through SDK 1.0.31
+The local Bridge sends base64 PNG, JPEG, WebP and GIF inputs through SDK 1.3.1
 `Agent.send({ text, images })`. Each `[image]` marker corresponds to the next
 attachment in transcript order; image bytes are not inserted into prompt text.
 Both message and tool-output content participate in transcript hashes, so

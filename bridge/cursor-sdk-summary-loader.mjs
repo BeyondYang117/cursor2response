@@ -2,9 +2,9 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const CURSOR_SDK_SUMMARY_HOOK_VERSION = "1.0.31";
+export const CURSOR_SDK_SUMMARY_HOOK_VERSION = "1.3.1";
 export const CURSOR_SDK_SUMMARY_HOOK_MARKER = "cursor2response.cursor-sdk-summary-hook";
-export const CURSOR_SDK_SUMMARY_FILTER_SIGNATURE = "function(e){return\"summary\"===e.type||\"summary-started\"===e.type||\"summary-completed\"===e.type}(e)";
+export const CURSOR_SDK_SUMMARY_FILTER_SIGNATURE = "function(t){return\"summary\"===t.type||\"summary-started\"===t.type||\"summary-completed\"===t.type}(t)";
 
 export function resolveCursorSdkLoadContract(resolve = (specifier) => import.meta.resolve(specifier)) {
   const entryUrl = resolve("@cursor/sdk");

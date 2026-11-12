@@ -1,12 +1,14 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
 
 const state = vi.hoisted(() => {
   const directory = `/tmp/cursor2response-compaction-${process.pid}-${Date.now()}`;
   process.env.CURSOR_SDK_BRIDGE_AGENT_STATE_DIR = directory;
   return { directory };
 });
-import { Agent, acknowledgePendingAgentOutput, normalizeResumeToolResults, runLocalAgentBody } from "./server.mjs";
+import { Agent, acknowledgePendingAgentOutput, agentCacheKey, normalizeResumeToolResults, runLocalAgentBody } from "./server.mjs";
 import { collectCursorSdkOutput, createCursorSdkCompletion } from "../core/cursor-sdk.ts";
 import { prepareResponsesRequest, responseToolContinuation } from "../core/openai.ts";
 
@@ -22,6 +24,13 @@ async function compact(options) {
   ]) await options.onDelta({ update });
 }
 
+async function* summaryEvents() {
+  yield { type: "summary", status: "running" };
+  yield { type: "summary", status: "completed" };
+  yield { type: "summary", status: "error" };
+  yield { type: "summary", status: "completed", fallback: true };
+}
+
 function harness(send) {
   vi.spyOn(console, "info").mockImplementation(() => {});
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -29,8 +38,9 @@ function harness(send) {
   const create = vi.spyOn(Agent, "create").mockResolvedValue(agent);
   const requests = [];
   const events = [];
+  const restarts = [];
   const sessionKey = crypto.randomUUID();
-  async function request(body) {
+  async function request(body, restart = false) {
     const prepared = prepareResponsesRequest(body, { id: "grok-4.6" });
     const continuation = responseToolContinuation(body);
     const completion = await createCursorSdkCompletion({ CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" }, {
@@ -38,13 +48,54 @@ function harness(send) {
       fetch: async (_url, init) => {
         const wire = JSON.parse(init.body);
         requests.push(wire);
-        const output = await runLocalAgentBody({
+        const input = {
           ...wire, workingDirectory: state.directory,
           clientTools: prepared.tools ?? [],
           resumeToolResults: normalizeResumeToolResults(wire.resumeToolResults, {}),
           hasIncrementalPrompt: Boolean(wire.incrementalPrompt), fullReplay: !wire.incrementalPrompt,
           supersededToolCallIds: wire.supersededToolCallIds ?? []
-        }, (event) => events.push(event));
+        };
+        let output;
+        if (restart) {
+          // A fresh process has no actors or callbacks. Only the persisted
+          // Bridge checkpoint crosses this boundary; mock the SDK cloud seam.
+          const script = `
+            import { readFileSync } from "node:fs";
+            import { Agent, runLocalAgentBody } from ${JSON.stringify(new URL("./server.mjs", import.meta.url).href)};
+            console.info = () => {};
+            console.warn = () => {};
+            const input = JSON.parse(readFileSync(0, "utf8"));
+            let resumed = false, sentPrompt;
+            const agent = { agentId: ${JSON.stringify(agent.agentId)}, close() {},
+              async send(prompt, options) {
+                sentPrompt = prompt;
+                await options.onDelta({ update: { type: "summary-started" } });
+                return { id: "restart-run", async cancel() {},
+                  async *stream() {
+                    yield { type: "summary", status: "completed", fallback: true };
+                    yield { type: "assistant", message: { content: [{ type: "text", text: "resumed answer" }] } };
+                  },
+                  async wait() { return { status: "finished", result: "" }; }
+                };
+              }
+            };
+            Agent.resume = async (id) => {
+              if (id !== agent.agentId) throw new Error("wrong persisted Agent");
+              resumed = true; return agent;
+            };
+            Agent.create = async () => agent;
+            const output = await runLocalAgentBody(input);
+            process.stdout.write(JSON.stringify({ output, resumed, sentPrompt }));
+          `;
+          const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+            input: JSON.stringify(input), encoding: "utf8", timeout: 10_000,
+            env: { ...process.env, CURSOR_SDK_BRIDGE_AGENT_STATE_DIR: state.directory }
+          });
+          expect(child.status, child.stderr).toBe(0);
+          const result = JSON.parse(child.stdout);
+          restarts.push(result);
+          output = result.output;
+        } else output = await runLocalAgentBody(input, (event) => events.push(event));
         acknowledgePendingAgentOutput(output);
         return Response.json(output);
       }
@@ -55,7 +106,7 @@ function harness(send) {
     });
     return collectCursorSdkOutput(completion.stream);
   }
-  return { agent, create, requests, events, request, warn };
+  return { agent, create, requests, events, request, warn, restarts };
 }
 
 describe("Responses native SDK compaction", () => {
@@ -68,6 +119,7 @@ describe("Responses native SDK compaction", () => {
         async *stream() {
           yield assistant("before ");
           await compact(options);
+          yield* summaryEvents();
           yield assistant("after");
         },
         wait: async () => ({ status: "finished", result: "" })
@@ -99,6 +151,7 @@ describe("Responses native SDK compaction", () => {
             const tool = options.local.customTools.inspect;
             for (const step of [1, 2]) {
               await compact(options);
+              yield* summaryEvents();
               const context = { toolCallId: `sdk-inspect-${step}` };
               const result = await tool.execute({ step }, context);
               results.push(result);
@@ -163,5 +216,43 @@ describe("Responses native SDK compaction", () => {
       };
     });
     await expect(h.request({ input: "Fail after compaction" })).rejects.toThrow("synthetic SDK execution failure");
+  });
+
+  it.each([false, true])("restores only clean checkpoints after compaction and process replacement (dirty=%s)", async (dirty) => {
+    const h = harness(async (_prompt, options) => {
+      await compact(options);
+      return {
+        id: crypto.randomUUID(), cancel: vi.fn(),
+        async *stream() { yield* summaryEvents(); yield assistant("first answer"); },
+        wait: async () => ({ status: "finished", result: "" })
+      };
+    });
+    const body = { input: [{ role: "user", content: "Initial task" }] };
+    await expect(h.request(body)).resolves.toMatchObject({ text: "first answer" });
+    const wire = h.requests[0];
+    const filename = path.join(state.directory, `${agentCacheKey({ ...wire, workingDirectory: state.directory })}.json`);
+    const checkpoint = JSON.parse(readFileSync(filename, "utf8"));
+    expect(checkpoint.dirty).toBe(false);
+    if (dirty) writeFileSync(filename, JSON.stringify({ ...checkpoint, dirty: true }));
+    body.input.push({ role: "assistant", content: "first answer" }, { role: "user", content: "Next task" });
+    await expect(h.request(body, true)).resolves.toMatchObject({ text: "resumed answer" });
+    expect(h.restarts[0].resumed).toBe(!dirty);
+    if (dirty) expect(h.restarts[0].sentPrompt).toContain("USER: Initial task");
+    else expect(h.restarts[0].sentPrompt).toBe("INPUT:\nUSER: Next task");
+    expect(JSON.parse(readFileSync(filename, "utf8")).dirty).toBe(false);
+  });
+
+  it.each([
+    { type: "summary", status: "unknown" },
+    { type: "summary" },
+    { type: "summary", status: "completed", fallback: "true" }
+  ])("rejects malformed SDK summary events: %j", async (event) => {
+    const h = harness(async () => ({
+      id: crypto.randomUUID(), cancel: vi.fn(),
+      async *stream() { yield event; yield assistant("must not escape"); },
+      wait: async () => ({ status: "finished", result: "" })
+    }));
+    await expect(h.request({ input: "Summarize" })).rejects.toThrow("unsupported semantic event");
+    expect(h.events.some((event) => event.type === "text")).toBe(false);
   });
 });
