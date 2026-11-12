@@ -45,6 +45,8 @@ curl --fail http://127.0.0.1:6718/v1/models \
 
 > **安全提示**：对外端口默认仅绑定 `127.0.0.1`。Trace Viewer 无内置鉴权，请勿直接暴露至公网；配置了默认 `CURSOR_API_KEY` 时，任何可访问 API 的客户端均可消耗该配额。完整配置与持久化备份见[本地部署指南](docs/runbooks/local-deployment.md)。
 
+不从源码构建、直接拉取 `linux/amd64` 与 `linux/arm64` 镜像时，使用 [`deploy/docker-compose.yaml`](deploy/docker-compose.yaml)。见[已发布镜像](docs/runbooks/local-deployment.md#published-image)。
+
 若当前网络需要代理才能访问 Cursor 服务，可在 `.env` 中配置标准 HTTP(S) 代理变量。Docker 宿主地址、HTTP/1.1 fallback、自定义 CA 与验收边界见[网络代理说明](docs/runbooks/local-deployment.md#network-proxy)。
 
 ## 接入客户端
@@ -135,7 +137,7 @@ Trace Viewer 将同一 Session 内的请求流转、Agent 迁移、SDK Run 生�
 | **同一 Run 内工具续接** | 客户端返回的工具结果直接结算原 SDK Run 挂起的回调，维持 SDK 内部 agent loop 完整。 |
 | **Native Steer** | 运行中的 Run 支持通过 `Run.steer()` 顺序接入新指令，无需中断当前执行。 |
 | **Trace Viewer** | 本地可视化面板，直观审计会话历史、上下文重放、工具耗时与运行时归属。 |
-| **上下文溢出 Fallback** | 选择 `cursor-relay` 后，确认 SDK context compaction 时将会话标记为使用配置的外部 Responses 端点。 |
+| **原生上下文压缩** | SDK 总结压缩后继续原 Cursor Run，保留工具回调与会话复用。 |
 | **原生系统提示词扩展** | 请求支持 `system_prompt` 参数，可自定义或完全剥离 Cursor 默认系统提示词。 |
 | **清晰的执行边界** | 区分过程思考与最终回复；支持精准关联取消；重启后支持恢复已干净完结的 Agent。 |
 
@@ -146,7 +148,7 @@ Trace Viewer 将同一 Session 内的请求流转、Agent 迁移、SDK Run 生�
 - **请求与 Run 解耦**：一次 HTTP 请求不等于一次 SDK Run。多次工具往返均在同一 Run 内闭环，避免每次工具返回都重新组装模型上下文。
 - **多轮复用与 Steering**：新轮次可在同一 Agent 上开启新 Run；若上一次执行尚未结束，新指令可通过 native steer 机制排队注入。
 - **前缀匹配与重放保护**：复用严格基于对话历史的前缀哈希比对。若检测到客户端对历史进行了总结压缩或手动修改，网关自动回退为全量重放，保障上下文一致性。
-- **API fallback**：选择 `cursor-relay`，并配置必填的 `C2R_PRIMARY_MODEL`、`C2R_FALLBACK_BASE_URL`、`C2R_FALLBACK_API_KEY`、`C2R_FALLBACK_MODEL`。确认 SDK compaction 后将会话标记为 fallback；当前请求只有尚未对外输出且 SDK 清理成功时才能自动补救。详见[配置方法](docs/runbooks/local-deployment.md#optional-api-fallback-route)与[路由契约](docs/specs/api-fallback.md)。
+- **API fallback**：选择 `cursor-relay`，并配置必填的 `C2R_PRIMARY_MODEL`、`C2R_FALLBACK_BASE_URL`、`C2R_FALLBACK_API_KEY`、`C2R_FALLBACK_MODEL`，可保留显式上下文溢出错误的备用路由。原生 SDK 压缩事件继续使用 Cursor，不触发 fallback；旧版 Bridge 的溢出错误只有尚未对外输出且 SDK 清理成功时才能自动补救。详见[配置方法](docs/runbooks/local-deployment.md#optional-api-fallback-route)与[路由契约](docs/specs/api-fallback.md)。
 - **原生 `system_prompt` 覆盖**：Responses 请求可传入非空字符串直接替换 Cursor SDK 默认系统提示词，或传 `false` 使用默认配置（需账号权限支持）。详见[系统提示词契约](docs/specs/responses-agent-context-affinity.md#native-system-prompt)。
 
 ## 项目缘起
@@ -160,7 +162,7 @@ Trace Viewer 将同一 Session 内的请求流转、Agent 迁移、SDK Run 生�
 - **图片输入：** Responses 支持 PNG、JPEG、WebP、GIF 的 base64 data URL，包括工具返回的图片。远程图片 URL 返回明确的 400，需改为 data URL；实际识图能力取决于模型。Bridge 请求体默认上限为 1 MiB（`CURSOR_SDK_BRIDGE_MAX_JSON_BYTES`），包含 base64 与完整历史，详见[图片输入契约](docs/specs/responses-agent-context-affinity.md#image-inputs)。
 - **核心协议：** `/v1/responses`，全面支持流式传输、客户端工具定义、工具结果连续回传及会话亲和性。Codex 与 OpenClaw 为核心验收标准。
 - **兼容端点（Best Effort）：** `/v1/chat/completions`、`/v1/messages` 及 `/v1/messages/count_tokens` 仅作基础功能适配，不承诺所有上游参数行为完全对齐。
-- **运行时：** 源码运行支持 Node.js 24 及以上版本（已验证 Node 24 与 26）；Linux amd64 Docker 镜像继续固定 Node.js 24 LTS，作为稳定部署基线。
+- **运行时：** 源码运行支持 Node.js 24 及以上版本（已验证 Node 24 与 26）。已发布镜像固定 Node.js 24 LTS，包含 `linux/amd64` 与 `linux/arm64`。已验证的部署基线仍是 Linux amd64。
 - **客户端历史要求：** 客户端必须自行维护并传回完整的上下文历史（包括工具调用、返回结果与阶段标注）；`previous_response_id` 不能替代历史内容。
 - **状态持久化：** Docker Compose 持久化 SDK checkpoint 与 Bridge 状态索引。正常退出的 Agent 重启后可无缝恢复，但运行中的任务与待返回的工具回调无法跨进程恢复。
 - **上下文计量：** 网关返回的 token 用量为基于字符的估算值，不代表 Cursor SDK 内部真实窗口占用；单次长 prompt 成功不代表多轮交互的安全上限。

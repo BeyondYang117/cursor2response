@@ -13,8 +13,7 @@ const sessionHeaderNames = [
   "thread_id",
   "x-session-affinity",
   "x-opencode-session-id",
-  "x-opencode-session",
-  "x-client-request-id"
+  "x-opencode-session"
 ];
 
 export function resolveSessionAffinity(

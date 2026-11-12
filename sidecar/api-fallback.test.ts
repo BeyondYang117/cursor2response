@@ -1,5 +1,11 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
+import { spawn } from "node:child_process";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -319,26 +325,22 @@ test.each([false, true])("notifies with the last user prompt during tool continu
       { type: "function_call_output", call_id: "call-one", output: "tool output" }
     ];
     request.inputs = [{ source: "tool_result", content: "tool output", callId: "call-one" }];
-    const notifyLog = path.join(config.stateDirectory, "notify.log");
     const script = path.join(config.stateDirectory, "notify-send");
-    await writeFile(script, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(notifyLog)}\n`, { mode: 0o755 });
+    const child = { on: vi.fn(), unref: vi.fn() };
+    vi.mocked(spawn).mockClear();
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     const create = () => new ApiFallbackRoute({ ...config, notifyCommand: script }, request, () => {},
       (async () => Response.json({ id: "resp-mp", object: "response", status: "completed", output: [] })));
     await (await create().recover(new CursorSdkContextOverflowError("SDK compacted", true), published))?.text();
     await (await create().initialResponse())!.text();
-    for (let i = 0; i < 50 && !(await readFile(notifyLog, "utf8").catch(() => "")).includes("session=session-one"); i++) {
-      await delay(20);
-    }
-    const lines = (await readFile(notifyLog, "utf8")).trim().split("\n");
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("session=session-one");
-    expect(lines[0]).toContain("hello");
-    expect(lines[0]).not.toContain("old request");
-    expect(lines[0]).not.toContain("Private context");
-    expect(lines[0]).not.toContain("tool output");
-    expect(lines[0]).toContain("traceId=resp-one");
-    expect(lines[0]).toContain("cursor2response");
-    expect(lines[0]).not.toContain("thisTurn=");
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledWith(script, fallbackNotifyArgs({
+      primaryModel: config.primaryModel, fallbackModel: config.model,
+      sessionKey: request.session.key, thisTurn: published ? "marked-only" : "recovered",
+      userSnippet: "hello", requestId: request.requestId
+    }), { detached: true, stdio: "ignore" });
+    expect(child.on).toHaveBeenCalledWith("error", expect.any(Function));
+    expect(child.unref).toHaveBeenCalledOnce();
     expect(apiFallbackConfig({
       C2R_PRIMARY_MODEL: "cursor-primary",
       C2R_FALLBACK_BASE_URL: "https://fallback.example/v1",

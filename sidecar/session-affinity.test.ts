@@ -14,7 +14,7 @@ describe("resolveSessionAffinity", () => {
     expect(resolveSessionAffinity(headers, { prompt_cache_key: "cache-key" }, () => "generated")).toEqual({
       key: "modern-session",
       source: "header:session-id",
-      sessionHeaders: ["session-id", "session_id", "thread-id", "x-client-request-id"]
+      sessionHeaders: ["session-id", "session_id", "thread-id"]
     });
   });
 
@@ -24,6 +24,11 @@ describe("resolveSessionAffinity", () => {
       source: "prompt_cache_key",
       sessionHeaders: []
     });
+  });
+
+  it("does not use a request identifier as conversation identity", () => {
+    expect(resolveSessionAffinity(new Headers({ "x-client-request-id": "shared-request" }), {}, () => "fresh-session"))
+      .toEqual({ key: "fresh-session", source: "generated", sessionHeaders: [] });
   });
 
   it("generates a fresh session when neither header nor prompt cache key is usable", () => {

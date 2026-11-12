@@ -92,6 +92,18 @@ ordered output. The adapter's rendering of the replayed `input` is therefore
 the authoritative public transcript order. SDK event arrival or callback
 delivery order cannot override it.
 
+## Native SDK compaction
+
+Native SDK summary updates change the SDK's internal checkpoint, not the
+adapter-authoritative public transcript. Keep the same Agent, active Run,
+bootstrap fingerprint, ordered transcript hashes, public tool IDs and callback
+ownership. Do not replay accepted history or resend tool results to compensate
+for summarization. The next independent turn still sends only the unaccepted
+suffix; edited public history still requires the usual Agent replacement.
+This permits lossy native context summarization and does not promise exact
+recall of all earlier content by the model. See
+[SDK event normalization](sdk-event-normalization.md#native-compaction-observation).
+
 ## Image inputs
 
 The local Bridge sends base64 PNG, JPEG, WebP and GIF inputs through SDK 1.0.31

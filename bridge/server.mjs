@@ -8,6 +8,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { createNdjsonWriter } from "./http-transport.mjs";
 import {
   CURSOR_SDK_SUMMARY_HOOK_MARKER,
   createCursorSdkSummaryHooks,
@@ -37,6 +38,7 @@ const port = parseInteger(process.env.CURSOR_SDK_BRIDGE_PORT, 8792);
 const bridgeToken = process.env.CURSOR_SDK_BRIDGE_TOKEN || "";
 const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 1024 * 1024);
 const maxAgents = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_AGENTS, 128);
+const maxRunsPerKey = Math.max(1, parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUNS_PER_KEY, 2));
 const runIdleTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 180 * 1000);
 const runMaxTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_MAX_TIMEOUT_MS, 300 * 1000);
 const toolBatchDiscoveryMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_TOOL_BATCH_DISCOVERY_MS, 10);
@@ -545,6 +547,7 @@ function takePendingNarration(pending) {
 }
 
 const sessionActors = new Map();
+const startingRunsPerKey = new Map();
 const retiredToolCalls = new Map();
 const recentRunTerminations = [];
 const runtimeStartedAt = new Date().toISOString();
@@ -610,6 +613,7 @@ export {
   parseTrajectoryInputs,
   parkPendingToolCall,
   recordPendingToolCallStatus,
+  readJsonBody,
   requirePendingAgentRunForToolResults,
   resolvePendingToolResults,
   runLocalAgentBody,
@@ -1003,22 +1007,27 @@ async function streamLocalAgent(input, response, signal, onProgress) {
     "Cache-Control": "no-cache, no-transform",
     "Access-Control-Allow-Origin": "*"
   });
+  const writer = createNdjsonWriter(response, signal);
   const emit = (event) => {
     if (closed) return false;
-    const wrote = writeNdjson(response, event);
+    const wrote = writer.write(event);
     if (!wrote) closed = true;
     return wrote;
   };
+  emit.drain = writer.write.drain;
+  emit.detach = writer.close;
   try {
     const output = await runLocalAgent(input, emit, signal, onProgress);
-    if (emit({ type: "done", output })) {
+    if (await emit.drain() && emit({ type: "done", output }) && await emit.drain()) {
       acknowledgePendingAgentOutput(output);
       await pendingAgentOutputAcknowledgement(output);
     }
   } catch (error) {
     await error?.contextRecoveryBarrier;
-    emit({ type: "error", error: openAiError(error).error });
+    if (await emit.drain()) emit({ type: "error", error: openAiError(error).error });
   } finally {
+    await emit.drain();
+    writer.close();
     response.off("close", markClosed);
     response.off("error", markClosed);
     socket?.off?.("error", markClosed);
@@ -1101,10 +1110,10 @@ async function runLocalAgentUnlocked(input, onEvent, signal, onProgress, options
   for (let attempt = 0; ; attempt += 1) {
     let emittedEvent = false;
     const emit = onEvent
-      ? (event) => {
+      ? Object.assign((event) => {
           emittedEvent = true;
           return onEvent(event);
-        }
+        }, { drain: onEvent.drain, detach: onEvent.detach })
       : undefined;
 
     try {
@@ -1436,13 +1445,26 @@ async function runLocalAgentBody(input, onEvent, signal, onProgress, options = {
       input.supersededToolCallIds = [];
       input.resumeToolResults = [];
     }
-    let agentEntry = await getAgent(input, signal, actor);
-    if (agentEntry.cached && !input.agentContext && !hasIndependentIncrementalPrompt(input)) {
-      input.fullReplayCause ??= "missing_incremental_prompt";
-      await evictAgent(agentEntry.cacheKey, agentEntry.agent, { keepActor: true });
-      agentEntry = await getAgent(input, signal, actor);
+    const credentialId = crypto.createHash("sha256").update(input.apiKey).digest("hex");
+    const activeRuns = [...sessionActors.values()].filter((candidate) => candidate.activeRun?.credentialId === credentialId).length;
+    const startingRuns = startingRunsPerKey.get(credentialId) ?? 0;
+    if (activeRuns + startingRuns >= maxRunsPerKey) {
+      throw new HttpError("Cursor API key has reached its active Run limit. Retry after an existing Run completes.", 429, "cursor_sdk_run_capacity_exceeded");
     }
-    return { response: startPendingAgentRun(input, agentEntry, onEvent, signal, onProgress) };
+    startingRunsPerKey.set(credentialId, startingRuns + 1);
+    try {
+      let agentEntry = await getAgent(input, signal, actor);
+      if (agentEntry.cached && !input.agentContext && !hasIndependentIncrementalPrompt(input)) {
+        input.fullReplayCause ??= "missing_incremental_prompt";
+        await evictAgent(agentEntry.cacheKey, agentEntry.agent, { keepActor: true });
+        agentEntry = await getAgent(input, signal, actor);
+      }
+      return { response: startPendingAgentRun(input, agentEntry, onEvent, signal, onProgress) };
+    } finally {
+      const remaining = startingRunsPerKey.get(credentialId) - 1;
+      if (remaining > 0) startingRunsPerKey.set(credentialId, remaining);
+      else startingRunsPerKey.delete(credentialId);
+    }
   });
   const output = await admission.response;
   if (options.deferTerminalAck !== true) {
@@ -1592,6 +1614,7 @@ async function startPendingAgentRun(
     }
   );
   pending.model = input.model;
+  pending.credentialId = crypto.createHash("sha256").update(input.apiKey).digest("hex");
   pending.emitReasoning = input.emitReasoning === true;
   pending.carriedUsage = carriedUsage;
   const subscriber = attachPendingAgentSubscriber(pending, {
@@ -1823,29 +1846,25 @@ async function handleCursorSdkDelta(pending, args) {
   if (!isRecord(update) || !["summary-started", "summary", "summary-completed"].includes(update.type)) {
     return;
   }
-  const summary = update.type === "summary" && typeof update.summary === "string" ? update.summary : "";
-  console.warn(JSON.stringify({
-    event: "cursor_sdk_summary_update",
-    ...pendingDiagnosticClock(pending),
-    requestId: pending.requestId,
-    sessionKey: pending.sessionKey,
-    runId: pending.run?.id || pending.cacheKey,
-    type: update.type,
-    ...(summary ? {
-      summaryChars: summary.length,
-      summarySha256: crypto.createHash("sha256").update(summary).digest("hex")
-    } : {})
-  }));
-  if (update.type !== "summary-started") return;
-  await failPendingAgentRun(
-    pending,
-    new HttpError(
-      "Cursor SDK compacted the conversation, so cursor2response can no longer preserve the full transcript.",
-      413,
-      "cursor_sdk_context_compacted"
-    ),
-    { cancelRun: true }
-  );
+  // Native compaction updates the SDK checkpoint within this Run. Keep the
+  // public transcript and owned tool callbacks intact; these are observations.
+  try {
+    const summary = update.type === "summary" && typeof update.summary === "string" ? update.summary : "";
+    console.warn(JSON.stringify({
+      event: "cursor_sdk_summary_update",
+      ...pendingDiagnosticClock(pending),
+      requestId: pending.requestId,
+      sessionKey: pending.sessionKey,
+      runId: pending.run?.id || pending.cacheKey,
+      type: update.type,
+      ...(summary ? {
+        summaryChars: summary.length,
+        summarySha256: crypto.createHash("sha256").update(summary).digest("hex")
+      } : {})
+    }));
+  } catch {
+    // Observation failures must not interrupt SDK execution.
+  }
 }
 
 function supersedingPrompt(input, pending) {
@@ -2345,7 +2364,7 @@ function runtimeSnapshot() {
   });
   return {
     schemaVersion: 1, observedAt: new Date(now).toISOString(), serviceInvocationId,
-    pid: process.pid, startedAt: runtimeStartedAt, pendingLeaseMs, cleanupTimeoutMs: runCleanupTimeoutMs,
+    pid: process.pid, startedAt: runtimeStartedAt, pendingLeaseMs, cleanupTimeoutMs: runCleanupTimeoutMs, maxRunsPerKey,
     counts: { agents: activeAgentCount(), activeRuns: runs.length, waitingTools: runs.filter((run) => run.phase === "waiting_tools").length, detachedRuns: runs.filter((run) => !run.subscriber.attached).length },
     counters: { ...runtimeCounters }, runs, recentTerminations: [...recentRunTerminations]
   };
@@ -2599,6 +2618,8 @@ function attachPendingAgentSubscriber(pending, input = {}) {
   const previous = actor.subscriber;
   if (previous) {
     previous.unbindAbort?.();
+    previous.eventSink?.detach?.();
+    previous.deferredEventSink?.detach?.();
     actor.subscriber = null;
   }
   const subscriber = {
@@ -2880,6 +2901,7 @@ async function consumePendingAgentRun(pending, run) {
   let terminalStatus = null;
   try {
     for await (const rawEvent of run.stream()) {
+      await activePendingAgentSubscriber(pending)?.eventSink?.drain?.();
       if (pending.terminalError) throw pending.terminalError;
       activePendingAgentSubscriber(pending)?.progressSink?.();
       logSdkTraceEvent(pending, run, rawEvent);
@@ -5028,7 +5050,7 @@ function validateJsonSchemaValue(value, schema, path, rootSchema = schema, seenR
       return `Invalid value for ${path}: expected at most ${schema.maxProperties} propert${schema.maxProperties === 1 ? "y" : "ies"}`;
     }
     for (const key of required) {
-      if (!(key in value) || value[key] === undefined || value[key] === null) {
+      if (!Object.prototype.hasOwnProperty.call(value, key) || value[key] === undefined) {
         return `Missing required argument for ${path}: ${key}`;
       }
     }
@@ -5038,7 +5060,7 @@ function validateJsonSchemaValue(value, schema, path, rootSchema = schema, seenR
         if (!Array.isArray(dependencies)) continue;
         for (const dependency of dependencies) {
           if (typeof dependency !== "string" || !dependency.trim()) continue;
-          if (!(dependency in value) || value[dependency] === undefined || value[dependency] === null) {
+          if (!Object.prototype.hasOwnProperty.call(value, dependency) || value[dependency] === undefined) {
             return `Missing dependent argument for ${path}: ${dependency}`;
           }
         }
@@ -6387,10 +6409,12 @@ function formatBytes(bytes) {
 }
 
 async function readJsonBody(request) {
-  let body = "";
+  const chunks = [];
+  let bytes = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (body.length > maxJsonBytes) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > maxJsonBytes) {
       throw new HttpError(
         `Request body too large: exceeds the ${formatBytes(maxJsonBytes)} bridge limit `
         + `(CURSOR_SDK_BRIDGE_MAX_JSON_BYTES=${maxJsonBytes}). `
@@ -6400,7 +6424,9 @@ async function readJsonBody(request) {
         "request_too_large"
       );
     }
+    chunks.push(buffer);
   }
+  const body = Buffer.concat(chunks, bytes).toString("utf8");
   if (!body.trim()) return {};
   try {
     return JSON.parse(body);
@@ -6420,19 +6446,6 @@ function writeJson(response, body, status = 200) {
   });
   response.end(data);
   return true;
-}
-
-function writeNdjson(response, body) {
-  if (response.writableEnded || response.destroyed) return false;
-  try {
-    response.write(`${JSON.stringify(body)}\n`);
-    return true;
-  } catch (error) {
-    if (error?.code === "EPIPE" || error?.code === "ERR_STREAM_DESTROYED") {
-      return false;
-    }
-    throw error;
-  }
 }
 
 function installBridgeProcessHandlers() {
@@ -6466,7 +6479,7 @@ function isBenignPipeError(error) {
 
 function isRetryableSDKRunError(error) {
   const values = flattenErrorValues(error);
-  if (values.some((value) => ["cursor_sdk_steer_failed", "cursor_sdk_system_prompt_unavailable"].includes(value?.code))) return false;
+  if (values.some((value) => ["cursor_sdk_steer_failed", "cursor_sdk_system_prompt_unavailable", "cursor_sdk_run_capacity_exceeded"].includes(value?.code))) return false;
   if (values.some((value) => value?.isRetryable === true)) return true;
   if (values.some((value) => value?.status === 429 || value?.status === 503 || value?.code === 8 || value?.code === 14)) return true;
   return values

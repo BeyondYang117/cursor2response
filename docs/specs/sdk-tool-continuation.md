@@ -105,6 +105,10 @@ An ordinary continuation must return the complete currently emitted batch. Resul
 
 The SDK may replay a callback with the same raw call ID after a partial batch is settled. When the tool name and arguments are identical, the Bridge reuses the parked callback promise or the previously settled SDK result and logs the duplicate with its reuse action; the outer tool is never executed twice. JSON object arguments use a stable structural fingerprint, so property order alone does not create a mismatch. A mismatched duplicate remains an HTTP 409 protocol conflict.
 
+Required input properties must be own properties. A present `null` value is
+validated against its property schema, including nullable unions; it is not
+treated as missing. The same presence rule applies to `dependentRequired`.
+
 Schema validation happens before any call in a batch is exposed. If one call is rejected, the entire rejected batch is returned through an internal correction continuation on the same Cursor run as `isError` results, so no sibling callback waits forever and no partial batch reaches the harness. Rejected calls and correction results do not enter the public Responses checkpoint.
 
 ## Recovery boundaries

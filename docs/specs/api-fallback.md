@@ -58,6 +58,9 @@ for both request IDs, even after the request alias is removed. Renaming a client
 model must not discard an existing sticky fallback decision or retry the SDK.
 Only confirmed `cursor_sdk_context_compacted` arms fallback. Generic 413,
 authentication, timeout, rate-limit and model failures do not.
+Native SDK `summary-started`, `summary` and `summary-completed` updates continue
+on the same Cursor Run and do not create this error or arm fallback. The typed
+error path remains compatible with explicit errors from older Bridge versions.
 
 For explicit identities, persist the marker before fallback, even when current
 recovery is unsafe. Later same-identity requests use fallback, including after

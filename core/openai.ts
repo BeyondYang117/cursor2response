@@ -483,6 +483,13 @@ export function prepareResponsesRequest(
   }
   validateResponsesToolChoice(record.tool_choice);
   validateResponsesReasoning(record.reasoning);
+  const textFormat = isRecord(record.text) && isRecord(record.text.format) ? record.text.format : undefined;
+  if (textFormat?.strict === true) {
+    throw new HttpError("Strict structured output is not supported by the Cursor SDK route.", 400, "unsupported_parameter", "text.format.strict");
+  }
+  if (record.parallel_tool_calls === false) {
+    throw new HttpError("Disabling parallel tool calls is not supported by the Cursor SDK route.", 400, "unsupported_parameter", "parallel_tool_calls");
+  }
   if (record.system_prompt !== undefined && record.system_prompt !== false
     && (typeof record.system_prompt !== "string" || !record.system_prompt.trim())) {
     throw new HttpError("system_prompt must be false or a non-empty string.", 400, "invalid_request_error", "system_prompt");

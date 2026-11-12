@@ -45,6 +45,8 @@ curl --fail http://127.0.0.1:6718/v1/models \
 
 > **Security Note**: Published ports bind strictly to `127.0.0.1` by default. The Trace Viewer has no built-in authentication—do not expose it to untrusted networks. If a default `CURSOR_API_KEY` is set in `.env`, any client reaching the API can consume its quota. For configuration, updates, and volume backups, see the [local deployment guide](docs/runbooks/local-deployment.md).
 
+To run the published `linux/amd64` and `linux/arm64` image without a source build, use [`deploy/docker-compose.yaml`](deploy/docker-compose.yaml). See [Published image](docs/runbooks/local-deployment.md#published-image).
+
 If Cursor services require an outbound proxy, configure the standard HTTP(S) proxy variables in `.env`. Docker host addressing, HTTP/1.1 fallback, custom CA, and verification limits are covered in the [network proxy guide](docs/runbooks/local-deployment.md#network-proxy).
 
 ## Connect a client
@@ -135,7 +137,7 @@ Screenshots use synthetic demo data. For session inspection and live log workflo
 | **In-run tool continuation** | Tool results settle pending callbacks on the active SDK Run, keeping the internal agent loop intact. |
 | **Native steering** | Inject new instructions into an in-progress Run via `Run.steer()` with ordered handling and delivery receipts. |
 | **Trace Viewer** | Local visual interface to inspect session history, context replays, tool latencies, and runtime ownership. |
-| **Context-overflow fallback** | Opt-in `cursor-relay` routes to a configured Responses endpoint when SDK context compaction occurs. |
+| **Native compaction** | SDK summarization continues on the same Cursor Run, preserving tool callbacks and session reuse. |
 | **Native system prompt** | Pass `system_prompt` on Responses requests to replace or strip the default Cursor system prompt. |
 | **Clean execution boundaries** | Intermediate commentary and final answers remain distinct; cancellations target the owning execution; clean Agents resume across restarts. |
 
@@ -146,7 +148,7 @@ Screenshots use synthetic demo data. For session inspection and live log workflo
 - **Decoupled Requests and Runs**: An HTTP request is not an SDK Run. Multiple tool round trips complete inside the same active Run, avoiding redundant context reconstruction.
 - **Multi-turn Reuse and Steering**: Subsequent user turns can start a new Run on the existing Agent, or inject prompt updates into an active Run via native steering.
 - **Prefix-matched Replays**: Reuse relies on an exact hash prefix match of conversation history. If client-side compaction or edits diverge from the accepted transcript, the gateway safely performs a full replay.
-- **API fallback**: Select `cursor-relay` and configure `C2R_PRIMARY_MODEL`, `C2R_FALLBACK_BASE_URL`, `C2R_FALLBACK_API_KEY` and `C2R_FALLBACK_MODEL`. Confirmed SDK compaction marks the session for fallback; the current request is recovered only before public output and after confirmed SDK cleanup. See [setup](docs/runbooks/local-deployment.md#optional-api-fallback-route) and the [routing contract](docs/specs/api-fallback.md).
+- **API fallback**: Select `cursor-relay` and configure `C2R_PRIMARY_MODEL`, `C2R_FALLBACK_BASE_URL`, `C2R_FALLBACK_API_KEY` and `C2R_FALLBACK_MODEL` for the explicit context-overflow error route. Native SDK summary updates continue on Cursor and do not trigger fallback. Legacy overflow errors can recover only before public output and after confirmed SDK cleanup. See [setup](docs/runbooks/local-deployment.md#optional-api-fallback-route) and the [routing contract](docs/specs/api-fallback.md).
 - **Native System Prompt Override**: Pass a non-empty `system_prompt` string to replace the Cursor system prompt, or pass `false` for the SDK default (requires account support). See the [system prompt contract](docs/specs/responses-agent-context-affinity.md#native-system-prompt).
 
 ## Why this project exists
@@ -161,7 +163,7 @@ Through intensive real-world use with Codex and OpenClaw, it evolved to incorpor
 
 - **Primary API:** `/v1/responses`, including streaming, client tools, tool-result continuation, and session affinity. Codex and OpenClaw serve as the main acceptance paths.
 - **Best effort:** `/v1/chat/completions`, `/v1/messages`, and `/v1/messages/count_tokens`. These endpoints do not claim full protocol conformance.
-- **Runtime:** Source execution supports Node.js 24 or later (verified on Node 24 and 26). The Linux amd64 Docker image stays pinned to Node.js 24 LTS for a stable deployment baseline.
+- **Runtime:** Source execution supports Node.js 24 or later (verified on Node 24 and 26). The published image is pinned to Node.js 24 LTS and includes `linux/amd64` and `linux/arm64`. Linux amd64 remains the verified deployment baseline.
 - **Conversation history:** Clients must preserve and send the full public history (including tool calls, results, and phases); `previous_response_id` does not replace that history.
 - **Restart behavior:** Compose volumes persist SDK checkpoints and Bridge state. Cleanly completed Agents can resume after restart; active Runs and pending tool callbacks do not survive process replacement.
 - **Context accounting:** Token counts are character-based estimates, not authoritative SDK context measurements. A successful single prompt does not establish a safe multi-turn context ceiling.

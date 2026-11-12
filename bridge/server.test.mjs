@@ -4273,7 +4273,7 @@ describe("Cursor SDK local-agent bridge", () => {
     }
   });
 
-  it("fails compacted runs and cancels an already attached SDK run once", async () => {
+  it("keeps an attached SDK run alive through repeated native compaction", async () => {
     const close = vi.fn();
     const cancel = vi.fn().mockResolvedValue(undefined);
     const pending = createPendingAgentRun(
@@ -4295,17 +4295,13 @@ describe("Cursor SDK local-agent bridge", () => {
     await handleCursorSdkDelta(pending, { update: { type: "summary-completed" } });
     await handleCursorSdkDelta(pending, { update: { type: "summary-started" } });
 
-    expect(pending.terminalError).toMatchObject({
-      status: 413,
-      code: "cursor_sdk_context_compacted",
-      contextRetrySafe: true
-    });
-    expect(cancel).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledOnce();
-    await expect(waitForPendingAgentEvent(pending)).rejects.toBe(pending.terminalError);
+    expect(pending.terminalError).toBeNull();
+    expect(pending.run.id).toBe("run-compact-attached");
+    expect(cancel).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
   });
 
-  it("preserves compact failure when summary-started arrives before run attachment", async () => {
+  it("attaches the same run when native compaction starts before send returns", async () => {
     const close = vi.fn();
     const cancel = vi.fn().mockResolvedValue(undefined);
     const pending = createPendingAgentRun(
@@ -4322,20 +4318,16 @@ describe("Cursor SDK local-agent bridge", () => {
     pending.model = "grok-4.6";
 
     await handleCursorSdkDelta(pending, { update: { type: "summary-started" } });
-    const compactError = pending.terminalError;
     await handleCursorSdkDelta(pending, { update: { type: "summary-completed" } });
 
-    await expect(attachPendingAgentRun(pending, {
+    await attachPendingAgentRun(pending, {
       id: "run-compact-before-attach",
       cancel
-    })).rejects.toBe(compactError);
-    expect(compactError).toMatchObject({
-      status: 413,
-      code: "cursor_sdk_context_compacted",
-      contextRetrySafe: false
     });
-    expect(cancel).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledOnce();
+    expect(pending.terminalError).toBeNull();
+    expect(pending.run.id).toBe("run-compact-before-attach");
+    expect(cancel).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
   });
 
   it.each(["cancel", "dispose"])("does not authorize context retry when %s fails", async (phase) => {
@@ -4348,7 +4340,9 @@ describe("Cursor SDK local-agent bridge", () => {
     pending.model = "grok-4.6";
     await attachPendingAgentRun(pending, { id: `run-cleanup-${phase}`,
       cancel: phase === "cancel" ? failure : vi.fn().mockResolvedValue(undefined) });
-    await handleCursorSdkDelta(pending, { update: { type: "summary-started" } });
+    await failPendingAgentRun(pending, Object.assign(new Error("explicit context overflow"), {
+      status: 413, code: "cursor_sdk_context_compacted"
+    }), { cancelRun: true });
     await pending.terminalError.contextRecoveryBarrier;
     expect(openAiError(pending.terminalError).error).toMatchObject({ code: "cursor_sdk_context_compacted", contextRetrySafe: false });
   });
@@ -7111,4 +7105,19 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(baseSendOptions).not.toHaveProperty("mcpServers");
     expect(dynamicSendOptions).not.toHaveProperty("mcpServers");
   });
+});
+
+it("distinguishes required nullable MCP arguments from missing and inherited properties", () => {
+  const tools = [{ name: "nullable", inputSchema: {
+    type: "object", required: ["value"],
+    properties: { value: { type: ["string", "null"] }, mode: { type: "string" }, dependent: { type: ["string", "null"] } },
+    dependentRequired: { mode: ["dependent"] }
+  } }];
+  expect(validateClientMcpToolCall(tools, "nullable", { value: null })).toBeNull();
+  expect(validateClientMcpToolCall(tools, "nullable", {})).toContain("Missing required argument");
+  expect(validateClientMcpToolCall(tools, "nullable", Object.create({ value: "inherited" }))).toContain("Missing required argument");
+  expect(validateClientMcpToolCall(tools, "nullable", { value: null, mode: "set", dependent: null })).toBeNull();
+  expect(validateClientMcpToolCall(tools, "nullable", { value: null, mode: "set" })).toContain("Missing dependent argument");
+  const nonNullable = [{ name: "required", inputSchema: { type: "object", required: ["value"], properties: { value: { type: "string" } } } }];
+  expect(validateClientMcpToolCall(nonNullable, "required", { value: null })).toContain("expected string");
 });

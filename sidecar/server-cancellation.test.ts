@@ -1074,7 +1074,7 @@ async function reservePort(): Promise<number> {
   return port;
 }
 
-async function startTestSidecar(bridgePort: number): Promise<{
+async function startTestSidecar(bridgePort: number, environment: NodeJS.ProcessEnv = {}): Promise<{
   sidecar: ChildProcess;
   sidecarPort: number;
   childOutput: Buffer[];
@@ -1090,7 +1090,9 @@ async function startTestSidecar(bridgePort: number): Promise<{
       PORT: String(sidecarPort),
       CURSOR_API_KEY: "cursor-test-key",
       CURSOR_SDK_BRIDGE_URL: `http://${host}:${bridgePort}/sdk`,
-      CURSOR2RESPONSE_FAILURE_TRACE_DIR: traceDirectory
+      CURSOR2RESPONSE_FAILURE_TRACE_DIR: traceDirectory,
+      C2R_API_TOKEN: "", C2R_ALLOWED_ORIGINS: "",
+      ...environment
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1169,3 +1171,106 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
   throw new Error("Timed out waiting for condition");
 }
+
+test("protects SDK admission and reports invalid public requests through HTTP", async () => {
+  const receivedKeys: string[] = [];
+  const bridge = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    receivedKeys.push(JSON.parse(body).apiKey);
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ text: "done", toolCalls: [], status: "finished" }));
+  });
+  let runtime: Awaited<ReturnType<typeof startTestSidecar>> | undefined;
+  try {
+    runtime = await startTestSidecar(await listenOnRandomPort(bridge), {
+      C2R_API_TOKEN: "gateway-test-token", C2R_ALLOWED_ORIGINS: "http://localhost:3000"
+    });
+    const endpoint = `http://${host}:${runtime.sidecarPort}/v1/responses`;
+    const post = (body: string, headers: Record<string, string> = {}) => fetch(endpoint, {
+      method: "POST", body, headers: { "content-type": "application/json", authorization: "Bearer gateway-test-token", ...headers }
+    });
+    expect((await post('{"input":"hello"}', { origin: "https://untrusted.example" })).status).toBe(403);
+    expect((await post('{"input":"hello"}', { authorization: "" })).status).toBe(401);
+    expect((await post('{"input":"hello"}', { authorization: "", origin: "http://localhost:3000" })).status).toBe(401);
+    for (const body of ["{", "", "null", "[]"]) {
+      expect((await post(body)).status).toBe(400);
+    }
+    for (const stream of [false, true]) {
+      const rejected = await post(JSON.stringify({ input: "hello", stream,
+        text: { format: { type: "json_schema", name: "answer", strict: true, schema: { type: "object" } } }
+      }));
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ error: { code: "unsupported_parameter", param: "text.format.strict" } });
+    }
+    expect(receivedKeys).toEqual([]);
+    const body = JSON.stringify({ model: "grok-4.6", input: "hello" });
+    const local = await post(body);
+    expect(local.status).toBe(200);
+    await local.text();
+    const browser = await post(body, {
+      origin: "http://localhost:3000", authorization: "Bearer own-cursor-key", "x-c2r-token": "gateway-test-token"
+    });
+    expect(browser.status).toBe(200);
+    expect(browser.headers.get("access-control-allow-origin")).toBe("http://localhost:3000");
+    await browser.text();
+    expect(receivedKeys).toEqual(["cursor-test-key", "own-cursor-key"]);
+  } finally {
+    await stopChild(runtime?.sidecar);
+    await closeServer(bridge);
+    if (runtime) await rm(runtime.traceDirectory, { recursive: true, force: true });
+  }
+});
+
+test.each([false, true])("bounds model discovery through headers and body (headersSent=%s)", async (headersSent) => {
+  let upstreamClosed = false;
+  const bridge = createServer((request, response) => {
+    request.resume();
+    response.on("close", () => { upstreamClosed = true; });
+    if (headersSent) response.writeHead(200, { "content-type": "application/json" }).write('{"models":[');
+  });
+  let runtime: Awaited<ReturnType<typeof startTestSidecar>> | undefined;
+  try {
+    runtime = await startTestSidecar(await listenOnRandomPort(bridge), { CURSOR_SDK_BRIDGE_TIMEOUT_MS: "100" });
+    const response = await fetch(`http://${host}:${runtime.sidecarPort}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "auto", input: "hello" }),
+      signal: AbortSignal.timeout(2000)
+    });
+    expect(response.status).toBe(504);
+    expect(await response.json()).toMatchObject({ error: { code: "cursor_models_timeout" } });
+    await waitFor(() => upstreamClosed);
+  } finally {
+    await stopChild(runtime?.sidecar);
+    await closeServer(bridge);
+    if (runtime) await rm(runtime.traceDirectory, { recursive: true, force: true });
+  }
+});
+
+test("cancels abandoned model discovery and permits a fresh request for the same key", async () => {
+  let requests = 0;
+  let upstreamClosed = false;
+  const bridge = createServer((request, response) => {
+    request.resume();
+    requests++;
+    if (requests === 1) response.on("close", () => { upstreamClosed = true; });
+    else response.writeHead(200, { "content-type": "application/json" }).end('{"models":[]}');
+  });
+  let runtime: Awaited<ReturnType<typeof startTestSidecar>> | undefined;
+  try {
+    runtime = await startTestSidecar(await listenOnRandomPort(bridge), { CURSOR_SDK_BRIDGE_TIMEOUT_MS: "5000" });
+    const url = `http://${host}:${runtime.sidecarPort}/v1/models`;
+    const controller = new AbortController();
+    const abandoned = fetch(url, { signal: controller.signal }).catch((error) => error);
+    await waitFor(() => requests === 1);
+    controller.abort();
+    expect(await abandoned).toMatchObject({ name: "AbortError" });
+    await waitFor(() => upstreamClosed);
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ data: [] });
+    expect(requests).toBe(2);
+  } finally {
+    await stopChild(runtime?.sidecar);
+    await closeServer(bridge);
+    if (runtime) await rm(runtime.traceDirectory, { recursive: true, force: true });
+  }
+});

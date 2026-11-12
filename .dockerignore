@@ -13,6 +13,7 @@
 !sidecar/**
 !scripts/
 !scripts/structured-log-runner.mjs
+!scripts/validate-api-fallback.ts
 !scripts/validate-grok-hybrid.ts
 !scripts/validate-responses-phases.ts
 !tools/

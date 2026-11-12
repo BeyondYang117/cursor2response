@@ -4057,3 +4057,18 @@ describe("OpenAI compatibility adapter", () => {
     expect(JSON.parse(toolCalls[0].function.arguments)).toEqual({ command: "pwd" });
   });
 });
+
+it.each([false, true])("rejects strict Responses output before SDK admission (stream=%s)", (stream) => {
+  expect(() => prepareResponsesRequest({
+    input: "hello", stream,
+    text: { format: { type: "json_schema", name: "answer", strict: true,
+      schema: { type: "object", properties: { answer: { type: "string" } } } } }
+  }, { id: "grok-4.6" })).toThrow(expect.objectContaining({
+    status: 400, code: "unsupported_parameter", param: "text.format.strict"
+  }));
+});
+
+it("rejects unsupported serial-only Responses tool execution", () => {
+  expect(() => prepareResponsesRequest({ input: "hello", parallel_tool_calls: false }, { id: "grok-4.6" }))
+    .toThrow(expect.objectContaining({ status: 400, code: "unsupported_parameter", param: "parallel_tool_calls" }));
+});

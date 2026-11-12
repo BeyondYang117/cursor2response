@@ -6,6 +6,7 @@ import { EventEmitter } from "node:events";
 
 const state = vi.hoisted(() => {
   process.env.CURSOR_SDK_BRIDGE_PENDING_LEASE_MS = "200";
+  process.env.CURSOR_SDK_BRIDGE_MAX_RUNS_PER_KEY = "2";
   process.env.CURSOR_SDK_BRIDGE_RUN_CLEANUP_TIMEOUT_MS = "50";
   return { directory: "" };
 });
@@ -62,6 +63,41 @@ function cancellation() {
 }
 
 describe("Bridge runtime ownership", () => {
+  it("reserves capacity before asynchronous Agent creation and releases failed admission", async () => {
+    const input = inputFor();
+    let rejectCreation;
+    const creation = new Promise((resolve, reject) => { rejectCreation = reject; });
+    const create = vi.spyOn(Agent, "create").mockReturnValue(creation);
+    const first = runLocalAgentBody(input).catch((error) => error);
+    const second = runLocalAgentBody({ ...inputFor(), apiKey: input.apiKey }).catch((error) => error);
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+    await expect(runLocalAgentBody({ ...inputFor(), apiKey: input.apiKey }))
+      .rejects.toMatchObject({ code: "cursor_sdk_run_capacity_exceeded" });
+    rejectCreation(new Error("creation failed"));
+    expect(await first).toMatchObject({ message: "creation failed" });
+    expect(await second).toMatchObject({ message: "creation failed" });
+    const replacement = await waitingRun({ ...inputFor(), apiKey: input.apiKey });
+    await expect(runLocalAgentBody(replacement.continuation)).resolves.toMatchObject({ text: "completed" });
+  });
+
+  it("counts waiting Runs across sessions and models while allowing continuation at capacity", async () => {
+    const first = await waitingRun();
+    const second = await waitingRun({ ...inputFor(), apiKey: first.input.apiKey, model: "another-model" });
+    try {
+      await expect(runLocalAgentBody({ ...inputFor(), apiKey: first.input.apiKey }))
+        .rejects.toMatchObject({ status: 429, code: "cursor_sdk_run_capacity_exceeded" });
+      const independent = await waitingRun();
+      await expect(runLocalAgentBody(independent.continuation)).resolves.toMatchObject({ text: "completed" });
+      await expect(runLocalAgentBody(first.continuation)).resolves.toMatchObject({ text: "completed" });
+      const replacement = await waitingRun({ ...inputFor(), apiKey: first.input.apiKey });
+      await expect(runLocalAgentBody(replacement.continuation)).resolves.toMatchObject({ text: "completed" });
+      await expect(runLocalAgentBody(second.continuation)).resolves.toMatchObject({ text: "completed" });
+    } finally {
+      await cancelAgentRequest(first.input.requestId, cancellation(), first.ownership);
+      await cancelAgentRequest(second.input.requestId, cancellation(), second.ownership);
+    }
+  });
+
   it("exposes live pending metadata without business payloads or credentials", async () => {
     const fixture = await waitingRun();
     const snapshot = runtimeSnapshot();

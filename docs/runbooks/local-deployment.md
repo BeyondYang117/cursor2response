@@ -42,6 +42,61 @@ Recheck health, runtime identity, served Viewer assets, and the behavior affecte
 
 `docker compose down` stops this stack and retains named volumes. `docker compose down -v` deletes those volumes and is a destructive reset, not an update procedure. Backups must include the SDK checkpoint storage and Bridge indexes together; an index alone is not a complete resumable conversation.
 
+## API access control
+
+CLI clients without an Origin header remain compatible with local deployments.
+Browser origins are denied by default. To enable a trusted web client, set
+`C2R_ALLOWED_ORIGINS` to a comma-separated list of exact HTTP(S) origins,
+including ports when needed. Wildcards and `null` are not accepted.
+
+Set `C2R_API_TOKEN` to a separate random gateway token when client access must be
+authenticated. With `CURSOR_API_KEY` configured, use this token as the client's
+API key (`Authorization: Bearer ...`). A client using its own Cursor key sends
+that key as usual and supplies `X-C2R-Token` separately. Health remains available
+without the token; allowing an Origin does not bypass token authentication.
+The internal Bridge token is a separate credential.
+
+## Published image
+
+`scripts/build-push.sh` builds one manifest for `linux/amd64` and `linux/arm64` and pushes it to `abu116/cursor2response`. The machine that runs the script needs Docker Buildx and a `docker login` session for that namespace. Docker Desktop already provides the cross-architecture emulation. A Linux builder needs QEMU registered before it can compile the other architecture:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install all
+```
+
+```bash
+docker login
+scripts/build-push.sh
+```
+
+The default tag is the current 12-character git SHA, and the script also updates `latest`. Pass a tag to override that: `scripts/build-push.sh 0.2.0`. `PUSH_LATEST=0` skips the `latest` tag. `PLATFORMS` can be narrowed to `linux/amd64` or `linux/arm64`.
+
+On the server, copy `deploy/docker-compose.yaml` and a private `.env` into one directory. Set `CURSOR_SDK_BRIDGE_TOKEN`. Set `C2R_IMAGE_TAG` when the deployment should pin a tag other than `latest`. The host pulls the architecture that matches itself.
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose ps
+curl --fail http://127.0.0.1:6718/health
+curl --fail http://127.0.0.1:8100/health
+curl --fail http://127.0.0.1:8100/api/runtime
+```
+
+This file uses the same project name and named volumes as the source Compose file. Keep one stack per port and volume set. Replacing Bridge drops active SDK runs and pending tool callbacks.
+
+Linux amd64 remains the verified deployment baseline. An arm64 host receives the arm64 image from the same manifest; confirm health, Bridge runtime identity, and a representative Responses request on that host before relying on it.
+
+To publish an update and roll a server forward:
+
+```bash
+scripts/build-push.sh
+```
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
 ## Direct source execution
 
 This is the complete three-process layout with shared Bridge authentication. If you previously used `node server.mjs start`, stop that managed stack with `node server.mjs stop` before using these commands on the same ports. The launcher generates a separate internal token; starting `npm run trace:viewer` beside it does not automatically connect runtime inspection.

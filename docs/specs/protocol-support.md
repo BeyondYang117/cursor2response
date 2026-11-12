@@ -82,3 +82,40 @@ Response writes respect transport backpressure. A disconnected client aborts
 the incoming request signal and cancels the response body, including a body
 created after the disconnect. The Bridge still owns whether detached execution
 continues or explicit cancellation terminates its Run.
+
+## Admission and output constraints
+
+Browser requests carrying an `Origin` are rejected with HTTP 403
+`origin_not_allowed` unless that exact HTTP(S) origin is in
+`C2R_ALLOWED_ORIGINS`. There is no wildcard or opaque (`null`) origin allowance.
+Only allowed origins receive an echoed CORS allow-origin header; responses vary
+by Origin. Local CLI requests without Origin remain supported.
+
+An optional independent `C2R_API_TOKEN` protects all API routes except GET/HEAD
+health and OPTIONS preflight. With a default Cursor key, clients may use the
+gateway token as their Bearer credential. Clients supplying their own Cursor
+key send the gateway token separately in `X-C2R-Token`. Preflight permission is
+not API authentication. Invalid JSON returns HTTP 400 `invalid_json`; JSON
+request bodies must be objects.
+
+Responses requests with `text.format.strict: true` or
+`parallel_tool_calls: false` return HTTP 400 `unsupported_parameter` before
+model discovery or SDK admission. The SDK route cannot enforce those semantics.
+Non-strict JSON formats, stop sequences and output token budgets remain prompt
+guidance, not hard enforcement. The same admission restrictions apply to the
+primary/fallback route, which requires compatibility with both legs.
+
+Account model discovery is bounded to ten seconds or the configured Bridge
+request deadline, whichever is shorter, including response body reads. Timeout
+returns HTTP 504 `cursor_models_timeout`. Concurrent requests with the same
+credential share discovery; cancelling one caller leaves other callers active,
+and the last caller leaving cancels the upstream request. Failed or cancelled
+lookups are not cached. Successful catalogs expire after one minute and the
+cache retains at most 256 credential entries.
+
+The Bridge decodes JSON only after collecting bounded byte chunks, preserving
+UTF-8 across network boundaries. Its configured request limit counts bytes.
+Bridge NDJSON stream consumption waits for subscriber backpressure, including
+terminal delivery before acknowledgement. A disconnected, cancelled or replaced
+subscriber releases the drain wait. A subscriber exceeding 32 MiB of buffered
+NDJSON is disconnected; an unsuccessful terminal delivery is not acknowledged.

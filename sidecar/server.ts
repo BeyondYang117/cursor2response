@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { createSidecarServer } from "./http-server.ts";
+import { withAccessPolicy } from "./access-policy.ts";
+import { ModelCatalog } from "./model-catalog.ts";
 import type { CursorTextEvent, CursorUsage } from "../core/cursor.ts";
-import { errorResponse, HttpError, json, notFound, openAiError, sseResponse, unauthorized } from "../core/http.ts";
+import { errorResponse, HttpError, json, notFound, openAiError, sseResponse, unauthorized, readJsonRequest } from "../core/http.ts";
 import {
   chatToolResults,
   chatChunk,
@@ -223,18 +225,18 @@ function resolveApiKey(request: Request): string {
   const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
   const bearer = match ? match[1].trim() : "";
   const candidate = apiKeyHeader || bearer;
-  if (candidate && candidate !== LOCAL_API_KEY_LITERAL) return candidate;
+  if (candidate && candidate !== LOCAL_API_KEY_LITERAL && candidate !== process.env.C2R_API_TOKEN?.trim()) return candidate;
   return (process.env.CURSOR_API_KEY || "").trim();
 }
 
-async function cursorModelSelection(requestedModel: string, body: unknown, apiKey?: string): Promise<{ id: string }> {
+async function cursorModelSelection(requestedModel: string, body: unknown, apiKey?: string, signal = new AbortController().signal): Promise<{ id: string }> {
   const rawModel = requestedModel.trim() || PRIMARY_MODEL;
   const match = /^([^\[]+?)(?:\[(.*)\])?$/.exec(rawModel);
   let modelId = (match?.[1] || PRIMARY_MODEL).trim();
   if (modelId.toLowerCase() === "default") modelId = "auto";
   let supportedParameters: Set<string> | undefined;
   if (apiKey && !isGrok46Family(modelId)) {
-    const catalog = await liveCursorModels(apiKey);
+    const catalog = await liveCursorModels(apiKey, signal);
     const normalizedModelId = modelId.split("/").filter(Boolean).at(-1) || modelId;
     const model = catalog.find((item) => item.id === normalizedModelId || item.aliases?.includes(normalizedModelId));
     supportedParameters = model ? new Set((model.parameters ?? []).map((parameter) => parameter.id)) : undefined;
@@ -279,13 +281,21 @@ interface CursorCatalogModel {
   variants?: CursorCatalogVariant[];
 }
 
-const MODEL_CATALOG_TTL_MS = 60_000;
-const modelCatalogCache = new Map<string, { models: CursorCatalogModel[]; expiresAt: number }>();
+const modelCatalog = new ModelCatalog<CursorCatalogModel[]>(async (apiKey, signal) => {
+  const configured = Number(env.CURSOR_SDK_BRIDGE_TIMEOUT_MS);
+  const timeoutMs = Number.isSafeInteger(configured) && configured > 0 ? Math.min(configured, 10_000) : 10_000;
+  const timeout = AbortSignal.timeout(timeoutMs);
+  try {
+    return await fetchCursorModels(apiKey, AbortSignal.any([signal, timeout]));
+  } catch (error) {
+    signal.throwIfAborted();
+    if (timeout.aborted) throw new HttpError("Cursor model discovery timed out.", 504, "cursor_models_timeout");
+    throw error;
+  }
+});
 
-async function apiKeyHash(apiKey: string): Promise<string> {
-  const bytes = new TextEncoder().encode(apiKey);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
+function liveCursorModels(apiKey: string, signal: AbortSignal): Promise<CursorCatalogModel[]> {
+  return modelCatalog.get(apiKey, signal);
 }
 
 function cursorSdkModelsUrl(): string {
@@ -299,11 +309,7 @@ function cursorSdkModelsUrl(): string {
   return url.toString();
 }
 
-async function liveCursorModels(apiKey: string): Promise<CursorCatalogModel[]> {
-  const cacheKey = await apiKeyHash(apiKey);
-  const cached = modelCatalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.models;
-
+async function fetchCursorModels(apiKey: string, signal: AbortSignal): Promise<CursorCatalogModel[]> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   const bridgeToken = env.CURSOR_SDK_BRIDGE_TOKEN?.trim();
   if (bridgeToken) headers.authorization = `Bearer ${bridgeToken}`;
@@ -311,7 +317,9 @@ async function liveCursorModels(apiKey: string): Promise<CursorCatalogModel[]> {
   const response = await deps.fetch(cursorSdkModelsUrl(), {
     method: "POST",
     headers,
-    body: JSON.stringify({ apiKey })
+    body: JSON.stringify({ apiKey }),
+    signal,
+    redirect: "error"
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -330,7 +338,6 @@ async function liveCursorModels(apiKey: string): Promise<CursorCatalogModel[]> {
   const models = Array.isArray(payload.models)
     ? payload.models.filter((model) => model && typeof model.id === "string" && typeof model.displayName === "string")
     : [];
-  modelCatalogCache.set(cacheKey, { models, expiresAt: Date.now() + MODEL_CATALOG_TTL_MS });
   return models;
 }
 
@@ -375,7 +382,7 @@ function openAiCatalogData(models: CursorCatalogModel[]): Array<Record<string, u
 async function handleModels(request: Request): Promise<Response> {
   const apiKey = resolveApiKey(request);
   if (!apiKey) return unauthorized();
-  const models = await liveCursorModels(apiKey);
+  const models = await liveCursorModels(apiKey, request.signal);
   const data = openAiCatalogData(models);
   try {
     if (apiFallbackConfig()) {
@@ -391,7 +398,7 @@ async function handleModel(request: Request, id: string): Promise<Response> {
   if (isApiFallbackModel(id) && apiFallbackConfig()) {
     return json({ id, object: "model", created: 0, owned_by: "cursor2response", name: API_FALLBACK_DISPLAY_NAME });
   }
-  const models = openAiCatalogData(await liveCursorModels(apiKey));
+  const models = openAiCatalogData(await liveCursorModels(apiKey, request.signal));
   const model = models.find((item) => item.id === id);
   if (!model) return openAiError(`Model '${id}' not found`, 404, "not_found", "model");
   return json(model);
@@ -401,9 +408,9 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   const apiKey = resolveApiKey(request);
   if (!apiKey) return unauthorized();
 
-  const body = await request.json();
+  const body = await readJsonRequest(request);
   const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
-  const cursorModel = await cursorModelSelection(requestedModel, body, apiKey);
+  const cursorModel = await cursorModelSelection(requestedModel, body, apiKey, request.signal);
   const prepared = prepareChatRequest(body, cursorModel);
 
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -426,15 +433,17 @@ async function handleResponses(request: Request): Promise<Response> {
   const apiKey = resolveApiKey(request);
   if (!apiKey) return unauthorized();
 
-  const body = await request.json();
+  const body = await readJsonRequest(request);
   const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
   const fallbackEnabled = isApiFallbackModel(requestedModel);
   const config = fallbackEnabled ? apiFallbackConfig() : undefined;
   if (fallbackEnabled && (!config || !hasSdkBridge())) {
     throw new HttpError("api-fallback requires SDK Bridge and fallback configuration.", 503, "api_fallback_not_configured");
   }
-  const cursorModel = await cursorModelSelection(config?.primaryModel ?? requestedModel, body, apiKey);
-  const prepared = prepareResponsesRequest(body, cursorModel);
+  // Reject unsupported public semantics before account discovery or SDK admission.
+  const prepared = prepareResponsesRequest(body, undefined);
+  const cursorModel = await cursorModelSelection(config?.primaryModel ?? requestedModel, body, apiKey, request.signal);
+  prepared.cursorModel = cursorModel;
   const toolContinuation = responseToolContinuation(body);
   const followUpPrompt = prepareResponsesFollowUpPrompt(body, cursorModel, toolContinuation.followUpInput);
 
@@ -683,7 +692,7 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
   const apiKey = resolveApiKey(request);
   if (!apiKey) return json(anthropicError("Missing or invalid x-api-key.", "authentication_error"), { status: 401 });
 
-  const body = await request.json();
+  const body = await readJsonRequest(request);
   const requestedModel =
     body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
       ? (body as { model: string }).model
@@ -691,7 +700,7 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
   const translatedBody = anthropicToChatBody(body);
   const requestedContext = contextFromAnthropicBeta(request.headers.get("anthropic-beta"));
   if (requestedContext) translatedBody.cursor_context = requestedContext;
-  const cursorModel = await cursorModelSelection(mapModel(requestedModel), translatedBody, apiKey);
+  const cursorModel = await cursorModelSelection(mapModel(requestedModel), translatedBody, apiKey, request.signal);
   const prepared = prepareChatRequest(translatedBody, cursorModel);
   logToolForwarding("anthropic", prepared);
   const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -745,7 +754,7 @@ async function handleAnthropicMessages(request: Request): Promise<Response> {
 /** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Same body shape as
  * `/v1/messages`. Auth is not required (it's only an estimate). */
 async function handleCountTokens(request: Request): Promise<Response> {
-  const body = await request.json();
+  const body = await readJsonRequest(request);
   const translatedBody = anthropicToChatBody(body);
   const prepared = prepareChatRequest(translatedBody, await cursorModelSelection(mapModel(""), translatedBody));
   return json({ input_tokens: estimateTokens(prepared.promptChars) });
@@ -1423,17 +1432,6 @@ async function captureFailureTrace(
 // ---------------------------------------------------------------------------
 
 async function route(request: Request, port: number): Promise<Response> {
-  if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-        "access-control-allow-headers": "authorization,content-type,x-api-key"
-      }
-    });
-  }
-
   const url = new URL(request.url);
   const pathname = url.pathname.replace(/\/+$/, "") || "/";
 
@@ -1503,7 +1501,7 @@ async function main(): Promise<void> {
       }));
     });
   }
-  const server = createSidecarServer((request) => route(request, port));
+  const server = createSidecarServer(withAccessPolicy((request) => route(request, port)));
   server.listen(port, HOST, () => {
     console.log(`cursor2response server running at http://${HOST}:${port}/v1`);
   });

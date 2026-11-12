@@ -3,9 +3,8 @@ const JSON_HEADERS = {
 };
 
 const CORS_HEADERS = {
-  "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,OPTIONS",
-  "access-control-allow-headers": "authorization,content-type,x-api-key,idempotency-key,x-session-affinity,x-opencode-session-id,x-opencode-session",
+  "access-control-allow-headers": "authorization,content-type,x-api-key,x-c2r-token,idempotency-key,x-session-affinity,x-opencode-session-id,x-opencode-session,session-id,session_id,x-session-id",
   "access-control-max-age": "86400"
 };
 
@@ -66,6 +65,20 @@ export class HttpError extends Error {
     this.status = status;
     this.code = code;
     this.param = param;
+  }
+}
+
+export async function readJsonRequest(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const body: unknown = await request.json();
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new HttpError("Request body must be a JSON object.", 400, "invalid_request_error");
+    }
+    return body as Record<string, unknown>;
+  } catch (error) {
+    request.signal.throwIfAborted();
+    if (error instanceof SyntaxError) throw new HttpError("Invalid JSON request body.", 400, "invalid_json");
+    throw error;
   }
 }
 

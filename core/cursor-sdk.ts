@@ -131,6 +131,7 @@ const TERMINAL_SDK_ERROR_CODES = new Set([
   "cursor_sdk_cancelled",
   "cursor_sdk_steer_failed",
   "cursor_sdk_system_prompt_unavailable",
+  "cursor_sdk_run_capacity_exceeded",
   "cursor_sdk_pending_lease_expired",
   "cursor_sdk_idle_timeout",
   "cursor_sdk_timeout",

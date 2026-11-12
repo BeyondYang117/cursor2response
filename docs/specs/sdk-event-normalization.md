@@ -6,7 +6,7 @@ Status: current
 
 This spec defines the boundary between raw `@cursor/sdk` run events and the
 stable events consumed by the local SDK Bridge. It covers `Run.stream()`
-messages, their consistency with `Run.wait()`, SDK compact interception, and
+messages, their consistency with `Run.wait()`, native SDK compaction, and
 the reasoning boundary between internal events and public protocols.
 
 ## Ownership
@@ -70,7 +70,7 @@ Duplicate identical terminal statuses are tolerated. Conflicting terminal
 statuses or a mismatch with `Run.wait()` fail closed. When no terminal status
 message is emitted, the validated `Run.wait()` result remains authoritative.
 
-## Compact interception
+## Native compaction observation
 
 `@cursor/sdk@1.0.31` suppresses `summary-started`, `summary`, and
 `summary-completed` before its documented per-send `onDelta` callback. The
@@ -80,17 +80,28 @@ loaded ESM source. The hook requires the exact package name, version, resolved E
 exact source signature match. Any drift prevents Bridge startup; there is no
 fallback to the public `task` event.
 
-The first `summary-started` is terminal. It sets an immutable pending-run error,
-marks the Agent dirty, evicts it, rejects parked callbacks, and cancels an
-attached run. If the update arrives before `Agent.send()` returns, attaching the
-run performs the cancellation. Later summary updates, cancellation, text, or
-errors cannot replace this first terminal state.
+Summary updates are observations, not terminal errors. Native compaction changes
+the SDK's internal conversation checkpoint while the same Run continues. The
+Bridge must not cancel, evict, replay, reset transcript hashes, reject parked
+tool callbacks, or trigger API fallback merely because a summary update arrives.
+This also applies before `Agent.send()` returns and across repeated compactions.
+Summary logging, serialization and hashing are best effort; their failures
+must not escape the awaited SDK callback or affect execution.
 
-The Bridge records internal code `cursor_sdk_context_compacted`. The Sidecar
-maps it to public HTTP 413 and code `context_length_exceeded`. A streaming
-Responses request ends with `response.failed`; events and tool side effects
-already delivered before detection cannot be retracted. This failure is not
-eligible for Bridge or Sidecar replay.
+The public transcript remains adapter-authoritative; native summaries do not
+replace client history or prove lossless model recall. Subsequent continuations
+still require the same ordered transcript prefix and matching public tool IDs.
+Actual SDK errors and explicit cancellation retain the normal failure contract.
+An explicit legacy `cursor_sdk_context_compacted` error remains supported by
+the existing typed error and safe-cleanup fallback path, but summary observation
+does not create one.
+
+The [official SDK reference](https://cursor.com/docs/sdk/typescript#interaction-updates)
+lists summary updates among normal interaction updates and documents awaited
+callbacks. The [release notes for 1.0.31](https://cursor.com/docs/release-notes/sdk#sep-3-2026)
+describe background subagent follow-ups and custom-tool annotations, not a
+requirement to fail on compaction. The package remains pinned to 1.0.31;
+changing versions requires separately validating the loader contract.
 
 ## Reasoning boundary
 
@@ -142,8 +153,9 @@ exposed by public protocol mappers.
 
 Automated tests must cover all nine documented SDK message categories,
 assistant multi-block atomicity, every tool status, usage validation, terminal
-reconciliation, unknown semantic shapes, loader drift, compact attach races,
-internal reasoning normalization, absence of synthetic public reasoning items,
+reconciliation, unknown semantic shapes, loader drift, native compaction before
+Run attachment, continued text and tools, unchanged transcript validation,
+observation failures, internal reasoning normalization, absence of synthetic public reasoning items,
 reasoning-only empty-turn failure, replay filtering, encrypted input, and
 Bridge NDJSON terminal rules. Existing pending continuation, tool batching,
 superseding turn, cancellation, and empty-turn suites remain required

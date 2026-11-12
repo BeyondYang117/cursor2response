@@ -5,7 +5,7 @@ for Docker quick start, client configuration, features, and known limits.
 
 ## Setup and troubleshooting
 
-- [Local Docker and source deployment](runbooks/local-deployment.md)
+- [Local Docker, published image, and source deployment](runbooks/local-deployment.md)
 - [Trace Viewer](runbooks/trace-viewer.md)
 
 ## Protocol and implementation contracts
