@@ -356,7 +356,10 @@ async function cmdModels(flags) {
   const host = requireHost(flags);
   const apiKey = requireApiKey();
   const response = await fetch(`http://${host}:${port}/v1/models`, {
-    headers: { Authorization: `Bearer ${apiKey}` }
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      ...(process.env.C2R_API_TOKEN?.trim() ? { "X-C2R-Token": process.env.C2R_API_TOKEN.trim() } : {})
+    }
   });
   if (!response.ok) {
     throw new Error(`GET /v1/models failed: ${response.status} ${response.statusText}`);

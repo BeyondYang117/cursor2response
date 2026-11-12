@@ -23,17 +23,19 @@ export class ModelCatalog<T> {
     let entry = this.pending.get(key);
     if (!entry) {
       const controller = new AbortController();
-      entry = { controller, promise: undefined!, waiters: 0, settled: false };
-      const current = entry;
-      current.promise = Promise.resolve().then(() => this.load(apiKey, controller.signal)).then((value) => {
-        controller.signal.throwIfAborted();
-        this.cache.set(key, { value, expiresAt: Date.now() + 60_000 });
-        while (this.cache.size > 256) this.cache.delete(this.cache.keys().next().value!);
-        return value;
-      }).finally(() => {
-        current.settled = true;
-        if (this.pending.get(key) === current) this.pending.delete(key);
-      });
+      const current: Pending<T> = {
+        controller, waiters: 0, settled: false,
+        promise: Promise.resolve().then(() => this.load(apiKey, controller.signal)).then((value) => {
+          controller.signal.throwIfAborted();
+          this.cache.set(key, { value, expiresAt: Date.now() + 60_000 });
+          while (this.cache.size > 256) this.cache.delete(this.cache.keys().next().value!);
+          return value;
+        }).finally(() => {
+          current.settled = true;
+          if (this.pending.get(key) === current) this.pending.delete(key);
+        })
+      };
+      entry = current;
       this.pending.set(key, current);
     }
     const current = entry;

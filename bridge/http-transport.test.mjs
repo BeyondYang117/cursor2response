@@ -3,7 +3,8 @@ import { Writable, Readable } from "node:stream";
 import { createNdjsonWriter } from "./http-transport.mjs";
 
 vi.hoisted(() => { process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES = "1024"; });
-const { readJsonBody } = await import("./server.mjs");
+const { readJsonBody, createPendingAgentRun, attachPendingAgentSubscriber, consumePendingAgentRun,
+  detachPendingAgentSubscriber, waitForPendingAgentEvent } = await import("./server.mjs");
 
 test("reads split UTF-8 requests without changing prompt, tool arguments or images", async () => {
   const expected = { prompt: "你好🙂", tools: [{ arguments: "中文参数" }], images: [{ data: "AQID" }] };
@@ -66,4 +67,36 @@ test("disconnects a slow subscriber before its buffer exceeds the bound", () => 
   expect(writer.write({ text: "x".repeat(40) })).toBe(false);
   expect(response.destroyed).toBe(true);
   writer.close();
+});
+
+test("SDK consumption pauses for a slow subscriber and replacement releases it without losing subsequent events", async () => {
+  const info = vi.spyOn(console, "info").mockImplementation(() => {});
+  const { response, chunks } = slowResponse();
+  const writer = createNdjsonWriter(response);
+  writer.write.detach = writer.close;
+  const pending = createPendingAgentRun(crypto.randomUUID(), { agent: { agentId: "test-agent" } }, "request-one", "test-session");
+  attachPendingAgentSubscriber(pending, { requestId: "request-one", eventSink: writer.write });
+  let pulled = 0;
+  const run = { id: "test-run", async *stream() {
+    for (const text of ["first", "second", "third"]) {
+      pulled++;
+      yield { type: "assistant", message: { content: [{ type: "text", text }] } };
+    }
+  }, wait: async () => ({ status: "finished", result: "" }) };
+  const completion = consumePendingAgentRun(pending, run);
+  try {
+    await vi.waitFor(() => expect(chunks).toHaveLength(1));
+    expect(pulled).toBe(2);
+    const replacement = vi.fn();
+    const subscriber = attachPendingAgentSubscriber(pending, { requestId: "request-two", eventSink: replacement });
+    await completion;
+    expect(chunks.map((chunk) => JSON.parse(chunk).text)).toEqual(["first"]);
+    expect(replacement.mock.calls.map(([event]) => event.text)).toEqual(["second", "third"]);
+    detachPendingAgentSubscriber(subscriber);
+    await waitForPendingAgentEvent(pending);
+  } finally {
+    writer.close();
+    response.destroy();
+    info.mockRestore();
+  }
 });
